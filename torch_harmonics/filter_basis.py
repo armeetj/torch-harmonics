@@ -32,6 +32,7 @@
 import abc
 from typing import Tuple, Union, Optional
 import math
+from typing_extensions import override
 
 import torch
 
@@ -60,7 +61,7 @@ class FilterBasis(metaclass=abc.ABCMeta):
 
     def __init__(
         self,
-        kernel_shape: Union[int, Tuple[int], Tuple[int, int]],
+        kernel_shape: Union[int, Tuple[int], Tuple[int, int], Tuple[int, int, int]],
     ):
 
         self.kernel_shape = kernel_shape
@@ -84,6 +85,58 @@ class FilterBasis(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+class FilterBasis3d(metaclass=abc.ABCMeta):
+    """
+    Abstract base class for a 3D filter basis.
+    """
+
+    def __init__(
+        self,
+        kernel_shape: Union[int, tuple[int, int, int]],
+    ):
+        """
+        Initializes the basis with a 3D kernel shape.
+
+        Args:
+            kernel_shape: The dimensions of the basis function palette.
+                          If an int, creates a cubic shape (k, k, k).
+        """
+        if isinstance(kernel_shape, int):
+            kernel_shape = (kernel_shape, kernel_shape, kernel_shape)
+        if len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape to be a tuple of 3 but got {kernel_shape} instead.")
+        
+        self.kernel_shape = kernel_shape
+
+    @property
+    @abc.abstractmethod
+    def kernel_size(self) -> int:
+        """
+        The total number of basis functions in the palette.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def compute_support_vals(self, grid: torch.Tensor, r_cutoff: float, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes the index set that falls into the kernel's spherical support
+        and returns both indices and values. This routine is designed for
+        sparse evaluations of the filter basis.
+
+        Args:
+            grid (torch.Tensor): A tensor of shape [3, D, H, W] representing the
+                                 (x, y, z) coordinates of the grid points.
+            r_cutoff (float): The radius of the spherical support.
+
+        Returns:
+            A tuple containing:
+            - iidx (torch.Tensor): A sparse index map of shape [nnz, 4] where each
+                                   row is (basis_idx, z_idx, y_idx, x_idx).
+            - vals (torch.Tensor): A flat tensor of shape [nnz] containing the
+                                   computed basis values.
+        """
+        raise NotImplementedError
+
 
 @lru_cache(typed=True, copy=False)
 def get_filter_basis(kernel_shape: Union[int, Tuple[int], Tuple[int, int]], basis_type: str) -> FilterBasis:
@@ -93,6 +146,9 @@ def get_filter_basis(kernel_shape: Union[int, Tuple[int], Tuple[int, int]], basi
         return PiecewiseLinearFilterBasis(kernel_shape=kernel_shape)
     elif basis_type == "morlet":
         return MorletFilterBasis(kernel_shape=kernel_shape)
+    elif basis_type == "morlet3d":
+        # TODO: replace with better typing
+        return MorletFilterBasis3d(kernel_shape=kernel_shape)
     elif basis_type == "zernike":
         return ZernikeFilterBasis(kernel_shape=kernel_shape)
     else:
@@ -275,6 +331,79 @@ class MorletFilterBasis(FilterBasis):
 
         return iidx, vals
 
+class MorletFilterBasis3d(FilterBasis3d):
+    """
+    3D Morlet-style filter basis on a sphere. A Hann window is
+    multiplied with a Fourier basis in x, y, and z directions.
+    """
+    def __init__(
+    self,
+    kernel_shape: Union[int, Tuple[int, int, int]],
+    ):
+        if isinstance(kernel_shape, tuple) and len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape to be a tuple of 3 but got {kernel_shape} instead.")
+        if isinstance(kernel_shape, int):
+            kernel_shape = [kernel_shape, kernel_shape, kernel_shape]
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    @override
+    def kernel_size(self):
+        """Total number of basis functions."""
+        return self.kernel_shape[0] * self.kernel_shape[1] * self.kernel_shape[2]
+
+    def hann_window(self, r: torch.Tensor, width: float = 1.0):
+        # anything outside window gets clamped to width, at which the value is 0 (thus not in the support)
+        r_clamped = torch.clamp(r, 0, width)
+        return torch.cos(0.5 * torch.pi * r_clamped / width) ** 2
+
+    def compute_support_vals(self, grid: torch.Tensor, r_cutoff: float, width: float = 1.0, **kwargs):
+        """
+        Computes the basis functions on a 3D grid within a spherical support.
+
+        Args:
+            grid (torch.Tensor): A tensor of shape [3, D, H, W] representing the
+                                 (x, y, z) coordinates of the grid points.
+            r_cutoff (float): The radius of the spherical support.
+            width (float): The characteristic width for the Fourier basis, typically r_cutoff.
+        """
+        x, y, z = grid[0], grid[1], grid[2]
+        r = torch.sqrt(x**2 + y**2 + z**2)
+
+        # Enumerator for each of the basis functions
+        # Shape: [kernel_size, 1, 1, 1] for broadcasting
+        ikernel = torch.arange(self.kernel_size, device=grid.device).view(-1, 1, 1, 1)
+        # Decompose the flat ikernel index into 3D (p, m, n) indices
+        # n is the fastest changing, for x-direction frequency
+        nkernel = ikernel % self.kernel_shape[2]
+        # m is for y-direction frequency
+        mkernel = (ikernel // self.kernel_shape[2]) % self.kernel_shape[1]
+        # p is the slowest, for z-direction frequency
+        pkernel = ikernel // (self.kernel_shape[2] * self.kernel_shape[1])
+
+        # get relevant indices
+        iidx = torch.argwhere((r <= r_cutoff) & torch.full_like(ikernel, True, dtype=torch.bool))
+
+        # get corresponding r, x, y, z coordinates
+        r_sparse = r[iidx[:, 1], iidx[:, 2], iidx[:, 3]] / r_cutoff
+        x_sparse = x[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+        y_sparse = y[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+        z_sparse = z[iidx[:, 1], iidx[:, 2], iidx[:, 3]]
+
+        n_sparse = nkernel[iidx[:, 0], 0, 0, 0]
+        m_sparse = mkernel[iidx[:, 0], 0, 0, 0]
+        p_sparse = pkernel[iidx[:, 0], 0, 0, 0]
+
+        # Generate the 3D harmonic pattern (separable Fourier basis)
+        # Use sine for odd indices, cosine for even indices to get different phases
+        harmonic_x = torch.where(n_sparse % 2 == 1, torch.sin(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width), torch.cos(torch.ceil(n_sparse / 2) * math.pi * x_sparse / width))
+        harmonic_y = torch.where(m_sparse % 2 == 1, torch.sin(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width), torch.cos(torch.ceil(m_sparse / 2) * math.pi * y_sparse / width))
+        harmonic_z = torch.where(p_sparse % 2 == 1, torch.sin(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width), torch.cos(torch.ceil(p_sparse / 2) * math.pi * z_sparse / width))
+
+        harmonic = harmonic_x * harmonic_y * harmonic_z
+        vals = self.hann_window(r_sparse, width=width) * harmonic
+
+        return iidx, vals
 
 class ZernikeFilterBasis(FilterBasis):
     """
