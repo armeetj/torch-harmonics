@@ -365,7 +365,7 @@ class MorletFilterBasis3d(FilterBasis3d):
             grid (torch.Tensor): A tensor of shape [3, D, H, W] representing the
                                  (x, y, z) coordinates of the grid points.
             r_cutoff (float): The radius of the spherical support.
-            width (float): The characteristic width for the Fourier basis, typically r_cutoff.
+            width (float): The characteristic width for the Fourier basis.
         """
         x, y, z = grid[0], grid[1], grid[2]
         r = torch.sqrt(x**2 + y**2 + z**2)
