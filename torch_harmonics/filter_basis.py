@@ -273,6 +273,101 @@ class PiecewiseLinearFilterBasis(FilterBasis):
         else:
             return self._compute_support_vals_isotropic(r, phi, r_cutoff=r_cutoff)
 
+class PiecewiseLinearFilterBasis3d(FilterBasis3d):
+    """
+    3D Piecewise Linear filter basis on a sphere.
+    Tensor-product basis constructed from piecewise linear basis functions
+    along radial and angular (θ, φ) directions.
+
+    This basis approximates separable filters in spherical coordinates
+    (r, θ, φ) using piecewise linear radial and angular terms.
+    """
+
+    def __init__(self, kernel_shape: Union[int, Tuple[int, int, int]]):
+        """
+        Args:
+            kernel_shape: If int, creates cubic shape (k, k, k).
+                          Tuple is (nr, ntheta, nphi).
+        """
+        if isinstance(kernel_shape, int):
+            kernel_shape = (kernel_shape, 1, 1)
+        elif len(kernel_shape) == 2:
+            kernel_shape = (kernel_shape[0], kernel_shape[1], 1)
+        elif len(kernel_shape) != 3:
+            raise ValueError(f"Expected kernel_shape of len 1-3 but got {kernel_shape}.")
+
+        super().__init__(kernel_shape=kernel_shape)
+
+    @property
+    def kernel_size(self):
+        nr, ntheta, nphi = self.kernel_shape
+        return nr * ntheta * nphi
+
+    def _compute_collocation_points(self, r_cutoff: float):
+        """
+        Precompute centers for piecewise linear segments in r, θ, and φ.
+        """
+        nr, ntheta, nphi = self.kernel_shape
+        dr = r_cutoff / (nr + 1)
+        dtheta = math.pi / ntheta if ntheta > 1 else math.pi
+        dphi = 2 * math.pi / nphi if nphi > 1 else 2 * math.pi
+
+        # centers of bins
+        ir = torch.arange(1, nr + 1) * dr
+
+        itheta = torch.linspace(0.0, math.pi, ntheta + 1, dtype=torch.float32)
+        iphi = torch.linspace(-math.pi, math.pi, nphi + 1, dtype=torch.float32)
+
+
+        return ir, itheta, iphi, dr, dtheta, dphi
+
+    def compute_support_vals(self, grid: torch.Tensor, r_cutoff: float, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes the index set that falls into the spherical kernel's support and returns both indices and values.
+        Designed for sparse evaluation of the filter basis.
+
+        Args:
+            grid (torch.Tensor): [3, D, H, W] containing x, y, z coordinates.
+            r_cutoff (float): Radius of spherical support.
+        """
+        x, y, z = grid[0], grid[1], grid[2]
+
+        # Convert to spherical coordinates
+        r = torch.sqrt(x**2 + y**2 + z**2)
+        theta = torch.acos(torch.clamp(z / (r + 1e-9), -1, 1))  # polar angle
+        phi = torch.atan2(y, x)  # azimuthal angle
+
+        ir, itheta, iphi, dr, dtheta, dphi = self._compute_collocation_points(r_cutoff)
+        nr, ntheta, nphi = self.kernel_shape
+        kernel_size = self.kernel_size
+
+        ikernel = torch.arange(kernel_size, device=grid.device).view(-1, 1, 1, 1)
+        kr = ikernel // (ntheta * nphi)
+        ktheta = (ikernel // nphi) % ntheta
+        kphi = ikernel % nphi
+
+        # radial / angular centers
+        cr = ir.to(grid.device)[kr]
+        ctheta = itheta.to(grid.device)[ktheta]
+        cphi = iphi.to(grid.device)[kphi]
+
+        # compute distances
+        dist_r = (r - cr).abs()
+        dist_theta = (theta - ctheta).abs()
+        dist_phi = torch.minimum((phi - cphi).abs(), (2 * math.pi - (phi - cphi).abs()))
+
+        cond = (r <= r_cutoff) & (dist_r <= dr) & (dist_theta <= dtheta) & (dist_phi <= dphi)
+        iidx = torch.argwhere(cond)
+
+        # For valid indices, compute piecewise linear weights
+        
+        vals_r = 1 - dist_r[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dr
+        vals_theta = 1 - dist_theta[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dtheta
+        vals_phi = 1 - dist_phi[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dphi
+
+        vals = vals_r * vals_theta * vals_phi
+
+        return iidx, vals
 
 class MorletFilterBasis(FilterBasis):
     """
