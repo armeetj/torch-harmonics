@@ -306,18 +306,19 @@ class PiecewiseLinearFilterBasis3d(FilterBasis3d):
     def _compute_collocation_points(self, r_cutoff: float):
         """
         Precompute centers for piecewise linear segments in r, θ, and φ.
+        Ensures bins are interior to valid ranges to avoid edge overflows.
         """
         nr, ntheta, nphi = self.kernel_shape
         dr = r_cutoff / (nr + 1)
         dtheta = math.pi / ntheta if ntheta > 1 else math.pi
         dphi = 2 * math.pi / nphi if nphi > 1 else 2 * math.pi
 
-        # centers of bins
+        # Centers of bins shifted inward (avoid including π and −π)
         ir = torch.arange(1, nr + 1) * dr
 
-        itheta = torch.linspace(0.0, math.pi, ntheta + 1, dtype=torch.float32)
-        iphi = torch.linspace(-math.pi, math.pi, nphi + 1, dtype=torch.float32)
-
+        # Slightly shift the angular bins to stay within (0, π) and (−π, π)
+        itheta = torch.linspace(0.0, math.pi, ntheta + 1, dtype=torch.float32)[:-1] + dtheta / 2
+        iphi = torch.linspace(-math.pi, math.pi, nphi + 1, dtype=torch.float32)[:-1] + dphi / 2
 
         return ir, itheta, iphi, dr, dtheta, dphi
 
