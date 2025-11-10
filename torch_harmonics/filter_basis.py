@@ -322,49 +322,80 @@ class PiecewiseLinearFilterBasis3d(FilterBasis3d):
 
         return ir, itheta, iphi, dr, dtheta, dphi
 
-    def compute_support_vals(self, grid: torch.Tensor, r_cutoff: float, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_support_vals(
+        self,
+        r: torch.Tensor,        # shape [...], radial distances
+        theta: torch.Tensor,    # shape [...], polar angles
+        phi: torch.Tensor,      # shape [...], azimuthal angles
+        r_cutoff: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes the index set that falls into the spherical kernel's support and returns both indices and values.
-        Designed for sparse evaluation of the filter basis.
+        Compute sparse index/value pairs for a 3D anisotropic piecewise-linear basis.
 
         Args:
-            grid (torch.Tensor): [3, D, H, W] containing x, y, z coordinates.
-            r_cutoff (float): Radius of spherical support.
+            r, theta, phi : tensors of identical shape (D, H, W) or flattened
+            r_cutoff      : radial support limit
         """
-        x, y, z = grid[0], grid[1], grid[2]
+        # Flatten into [N] vector
+        r_flat = r.reshape(-1)
+        theta_flat = theta.reshape(-1)
+        phi_flat = phi.reshape(-1)
 
-        # Convert to spherical coordinates
-        r = torch.sqrt(x**2 + y**2 + z**2)
-        theta = torch.acos(torch.clamp(z / (r + 1e-9), -1, 1))  # polar angle
-        phi = torch.atan2(y, x)  # azimuthal angle
-
-        ir, itheta, iphi, dr, dtheta, dphi = self._compute_collocation_points(r_cutoff)
         nr, ntheta, nphi = self.kernel_shape
         kernel_size = self.kernel_size
 
-        ikernel = torch.arange(kernel_size, device=grid.device).view(-1, 1, 1, 1)
-        kr = ikernel // (ntheta * nphi)
-        ktheta = (ikernel // nphi) % ntheta
-        kphi = ikernel % nphi
+        ir, itheta, iphi, dr, dtheta, dphi = self._compute_collocation_points(r_cutoff)
 
-        # radial / angular centers
-        cr = ir.to(grid.device)[kr]
-        ctheta = itheta.to(grid.device)[ktheta]
-        cphi = iphi.to(grid.device)[kphi]
+        ir = ir.to(r.device)
+        itheta = itheta.to(r.device)
+        iphi = iphi.to(r.device)
 
-        # compute distances
-        dist_r = (r - cr).abs()
-        dist_theta = (theta - ctheta).abs()
-        dist_phi = torch.minimum((phi - cphi).abs(), (2 * math.pi - (phi - cphi).abs()))
+        k = torch.arange(kernel_size, device=r.device)
 
-        cond = (r <= r_cutoff) & (dist_r <= dr) & (dist_theta <= dtheta) & (dist_phi <= dphi)
+        kr = k // (ntheta * nphi)
+        ktheta = (k // nphi) % ntheta
+        kphi = k % nphi
+
+        # Expand centers to broadcast with r_flat
+        cr = ir[kr].unsqueeze(1)
+        ctheta = itheta[ktheta].unsqueeze(1)
+        cphi = iphi[kphi].unsqueeze(1)
+
+        # Expand spatial points
+        r_exp = r_flat.unsqueeze(0)
+        theta_exp = theta_flat.unsqueeze(0)
+        phi_exp = phi_flat.unsqueeze(0)
+
+        # Compute distances
+        dist_r = (r_exp - cr).abs()
+        dist_theta = (theta_exp - ctheta).abs()
+
+        # Periodic wrap for phi
+        raw_dphi = (phi_exp - cphi).abs()
+        dist_phi = torch.minimum(raw_dphi, 2*math.pi - raw_dphi)
+
+        # Support condition: radial + angular support
+        cond = (
+            (r_exp <= r_cutoff)
+            & (dist_r <= dr)
+            & (dist_theta <= dtheta)
+            & (dist_phi <= dphi)
+        )  # [K, N]
+
+        # iidx has rows [kernel_index, point_index]
         iidx = torch.argwhere(cond)
 
-        # For valid indices, compute piecewise linear weights
-        
-        vals_r = 1 - dist_r[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dr
-        vals_theta = 1 - dist_theta[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dtheta
-        vals_phi = 1 - dist_phi[iidx[:, 0], iidx[:, 1], iidx[:, 2], iidx[:, 3]] / dphi
+        if iidx.numel() == 0:
+            return iidx, torch.zeros(0, device=r.device)
+
+        # Compute piecewise linear factors for each contributing pair
+        dist_r_sel = dist_r[iidx[:, 0], iidx[:, 1]]
+        dist_theta_sel = dist_theta[iidx[:, 0], iidx[:, 1]]
+        dist_phi_sel = dist_phi[iidx[:, 0], iidx[:, 1]]
+
+        vals_r = 1 - dist_r_sel / dr
+        vals_theta = 1 - dist_theta_sel / dtheta
+        vals_phi = 1 - dist_phi_sel / dphi
 
         vals = vals_r * vals_theta * vals_phi
 
